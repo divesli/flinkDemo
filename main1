@@ -1,0 +1,229 @@
+package com.xy;
+
+import cn.hutool.core.lang.Pair;
+import cn.hutool.core.util.NumberUtil;
+import cn.hutool.http.HttpUtil;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.xy.conf.*;
+import com.xy.conf.serialization.FrameKeyedSerializationSchema;
+import com.xy.conf.serialization.FrameSchema;
+import com.xy.conf.serialization.MessageSchema;
+import com.xy.enums.Health;
+import com.xy.enums.TransferType;
+import com.xy.model.Spacecraft;
+import com.xy.model.SpacecraftParam;
+import com.xy.param.ParamHandler;
+import com.xy.param.ParamHandlerFactory;
+import com.xy.protobuf.Any;
+import com.xy.util.Util;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.state.BroadcastState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.BroadcastStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.co.BroadcastProcessFunction;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.util.Collector;
+
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static com.xy.conf.ApplicationConfigConstant.*;
+import static com.xy.util.PBUtil.print;
+import static com.xy.util.PBUtil.unpack;
+import static com.xy.util.Util.buildHexCode;
+
+/**
+ * @author yanweichen
+ * createTime 2019/7/8
+ */
+@Slf4j
+public class StartApplication {
+
+    private static final MapStateDescriptor<String, Map<Long, Map<String, SpacecraftParam>>> CONFIG_BROADCAST = new MapStateDescriptor<>(
+            "CONFIG_BROADCAST",
+            BasicTypeInfo.STRING_TYPE_INFO,
+            TypeInformation.of(new TypeHint<Map<Long, Map<String, SpacecraftParam>>>() {
+            }));
+
+    public static void main(String[] args) throws Exception {
+        ApplicationConfig applicationConfig = ApplicationConfig.getApplicationConfig();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        String parallelism = applicationConfig.getConfig().getProperty(PARALLELISM, "1");
+        env.setParallelism(Integer.valueOf(parallelism));
+        //数据源
+        DataStreamSource<ExchangeMessage.Frame> frameDataStreamSource = env.addSource(
+                new FlinkKafkaConsumer<>(Arrays.asList(TransferType.ACTUAL.getReceiveTopic()
+                        , TransferType.DELAY.getReceiveTopic(), TransferType.SIMULATE.getReceiveTopic()
+                ), new FrameSchema(), applicationConfig.getConfig()));
+        //配置变更监听源
+        DataStreamSource<Message.MsgBean> configChangeStream = env.addSource(
+                new FlinkKafkaConsumer<>("message_topic", new MessageSchema(), applicationConfig.getConfig()));
+        FlinkKafkaProducer<ExchangeMessage.Frame> myProducer = new FlinkKafkaProducer<>(
+                TransferType.SIMULATE.getResultTopic(),// target topic
+                new FrameKeyedSerializationSchema(), applicationConfig.getConfig());
+        //配置广播流
+        BroadcastStream<Map<Long, Map<String, SpacecraftParam>>> broadcast = configChangeStream.map(new MapFunction<Message.MsgBean, Map<Long, Map<String, SpacecraftParam>>>() {
+            @Override
+            public Map<Long, Map<String, SpacecraftParam>> map(Message.MsgBean value) {
+                return getConfig();
+            }
+        }).broadcast(CONFIG_BROADCAST);
+
+        frameDataStreamSource.connect(broadcast).process(new BroadcastProcessFunction<ExchangeMessage.Frame, Map<Long, Map<String, SpacecraftParam>>, ExchangeMessage.Frame>() {
+
+            private static final String CONFIG_KEY = "configKey";
+
+            private volatile Map<Long, Map<String, SpacecraftParam>> config;
+
+            @Override
+            public void open(Configuration parameters) throws Exception {
+                super.open(parameters);
+                config = getConfig();
+            }
+
+            @Override
+            public void processElement(ExchangeMessage.Frame frame, ReadOnlyContext ctx, Collector<ExchangeMessage.Frame> out) throws Exception {
+                Map<Long, Map<String, SpacecraftParam>> config = ctx.getBroadcastState(CONFIG_BROADCAST).get(CONFIG_KEY);
+                if (config == null) {
+                    config = this.config;
+                } else {
+                    this.config = config;
+                }
+                Optional<ExchangeMessage.TelemeterFrame> telemeterParamsOptional = unpack(frame.getPayload(), ExchangeMessage.TelemeterFrame.class);
+                if (!telemeterParamsOptional.isPresent()) {
+                    log.warn("数据解析错误:" + print(frame.getHead()).orElse("无法格式化数据!"));
+                    return;
+                }
+                ExchangeMessage.Frame resultFrame;
+                try {
+                    resultFrame = buildResults(frame, telemeterParamsOptional.get(), config);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    return;
+                }
+                out.collect(resultFrame);
+            }
+
+            @Override
+            public void processBroadcastElement(Map<Long, Map<String, SpacecraftParam>> config, Context ctx, Collector<ExchangeMessage.Frame> out) throws Exception {
+                BroadcastState<String, Map<Long, Map<String, SpacecraftParam>>> broadcastState = ctx.getBroadcastState(CONFIG_BROADCAST);
+                config.put(666L, new HashMap<>());
+                broadcastState.put(CONFIG_KEY, config);
+            }
+        }).addSink(myProducer);
+        env.execute();
+    }
+
+    private static Map<Long, Map<String, SpacecraftParam>> getConfig() {
+        HashMap<String, Object> map = new HashMap<>();
+        map.put("selectAll", "true");
+        String host = ApplicationConfig.getApplicationConfig().getConfig().getProperty(CLOUD_CORE_HOST);
+        String allSpacecraftListJson = HttpUtil.post(host + ApiStore.SPACECRAFT_LIST.getUrl(), map);
+        JSONObject spacecraftJsonObject = JSON.parseObject(allSpacecraftListJson);
+        JSONArray spacecraftJsonArray = spacecraftJsonObject.getJSONObject("data").getJSONArray("list");
+        if (spacecraftJsonArray == null) {
+            return new HashMap<>();
+        }
+        List<Spacecraft> spacecraftList = spacecraftJsonArray.toJavaList(Spacecraft.class);
+        return spacecraftList.stream().collect(Collectors.toMap(s -> Long.valueOf(s.getSpaceIdentificationWord(), 16), s -> {
+            String paramJson = HttpUtil.post(host + ApiStore.SPACECRAFT_PARAM_LIST.getUrl() + s.getSpacecraftId(), map);
+            JSONObject paramJsonObject = JSON.parseObject(paramJson);
+            JSONArray paramJsonArray = paramJsonObject.getJSONObject("data").getJSONArray("list");
+            if (paramJsonArray == null) {
+                return new HashMap<>();
+            }
+            List<SpacecraftParam> paramList = paramJsonArray.toJavaList(SpacecraftParam.class);
+            return paramList.stream().collect(Collectors.toMap(SpacecraftParam::getParamCode, p -> p));
+        }));
+    }
+
+    private static ExchangeMessage.Frame buildResults(ExchangeMessage.Frame frame
+            , ExchangeMessage.TelemeterFrame telemeterFrame, Map<Long, Map<String, SpacecraftParam>> config) throws Exception {
+        Map<String, SpacecraftParam> paramMap = config.get(frame.getHead().getSpacecraft());
+        if (paramMap == null) {
+            log.warn("航天器配置信息不存在!识别字:" + buildHexCode(frame.getHead().getSpacecraft()));
+            return frame.toBuilder().build();
+        }
+        List<ExchangeMessage.TelemeterParams> packageParamsList = telemeterFrame.getPackageParamsList();
+        ExchangeMessage.Head head = null;
+        List<ExchangeMessage.TelemeterParams> setValuePackageParamsList = new ArrayList<>();
+        for (ExchangeMessage.TelemeterParams telemeterParams : packageParamsList) {
+            List<ExchangeMessage.TelemeterParam> paramsList = telemeterParams.getParamsList();
+            List<ExchangeMessage.TelemeterParam> setValueParamList = new ArrayList<>();
+            ExchangeMessage.TelemeterParams.Builder telemeterParamsBuilder = telemeterParams.toBuilder();
+            for (ExchangeMessage.TelemeterParam telemeterParam : paramsList) {
+                String result = (String) doMethod(frame, telemeterParam);
+                ParamHandler handler = ParamHandlerFactory.getHandler(frame, telemeterParam);
+                Pair<ExchangeMessage.Head, ExchangeMessage.TelemeterParam> handleParam = handler.handleParam(result);
+                if (handleParam.getKey() != null) {
+                    head = handleParam.getKey();
+                }
+                ExchangeMessage.TelemeterParam value = handleParam.getValue();
+                ExchangeMessage.TelemeterParam.Builder telemeterParamBuilder = value.toBuilder();
+                SpacecraftParam spacecraftParam = paramMap.get(value.getCode());
+                if (spacecraftParam != null) {
+                    //健康度判断
+                    if (spacecraftParam.getParamLowerLimit() != null && spacecraftParam.getParamUpperLimit() != null) {
+                        telemeterParamBuilder.setHealth(getHealth(value, spacecraftParam).getType());
+                    }
+                }
+                ExchangeMessage.TelemeterParam finalParam = telemeterParamBuilder.build();
+                telemeterParamsBuilder.putParamsMap(finalParam.getCode(), finalParam);
+                setValueParamList.add(finalParam);
+            }
+            setValuePackageParamsList.add(telemeterParamsBuilder.clearParams().addAllParams(setValueParamList).build());
+        }
+        ExchangeMessage.TelemeterFrame newTelemeterFrame = telemeterFrame.toBuilder().clearPackageParams()
+                .addAllPackageParams(setValuePackageParamsList).build();
+        ExchangeMessage.Frame.Builder frameBuilder = frame.toBuilder();
+        if (head != null) {
+            frameBuilder.setHead(head);
+        }
+        return frameBuilder.setPayload(Any.pack(newTelemeterFrame)).build();
+    }
+
+    private static Health getHealth(ExchangeMessage.TelemeterParam value, SpacecraftParam spacecraftParam) {
+        Double aDouble;
+        try {
+            aDouble = Double.valueOf(value.getValue());
+        } catch (Exception e) {
+            return Health.NORMAL;
+        }
+        if (aDouble > spacecraftParam.getParamUpperLimit()) {
+            return Health.HIGH;
+        } else if (aDouble < spacecraftParam.getParamLowerLimit()) {
+            return Health.LOW;
+        } else {
+            return Health.NORMAL;
+        }
+    }
+
+    private static Object doMethod(ExchangeMessage.Frame receiveFrame
+            , ExchangeMessage.TelemeterParam telemeterParam) throws Exception {
+        long spacecraftId = receiveFrame.getHead().getSpacecraft();
+        long paramId = telemeterParam.getId();
+        String jarName = Util.buildClassName(spacecraftId, paramId);
+        Class<?> cls = Class.forName("com.xy.yc." + jarName);
+        Method method = cls.getMethod("action", byte[].class);
+        String s = telemeterParam.getValueOrigin().toString("UTF-8");
+        byte[] bytes = ArrayUtils.toPrimitive(Util.getStrList(s, 8).stream()
+                .map(NumberUtil::binaryToInt)
+                .map(Integer::byteValue)
+                .toArray(Byte[]::new));
+        // DSL方法处理遥测参数值
+        return method.invoke(cls.newInstance(), bytes);
+    }
+
+}
