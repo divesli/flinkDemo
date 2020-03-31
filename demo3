@@ -1,0 +1,326 @@
+package com.xy;
+
+import cn.hutool.core.util.HexUtil;
+import cn.hutool.http.HttpUtil;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.xy.conf.ApiStore;
+import com.xy.conf.ApplicationConfig;
+import com.xy.conf.PropertiesWord;
+import com.xy.conf.serialization.FrameSchema;
+import com.xy.conf.serialization.MessageSchema;
+import com.xy.conf.serialization.RemoteControlFrameSchema;
+import com.xy.protocol.IProtocolHandler;
+import com.xy.protocol.ProtocolFactory;
+import com.xy.util.Consts;
+import com.xy.util.PBUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.state.BroadcastState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.BroadcastStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.co.BroadcastProcessFunction;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.util.Collector;
+
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author Administrator
+ * createTime 2019/10/10
+ */
+@Slf4j
+public class StartParseHeader {
+
+    // 定义广播流数据结构
+    private static final MapStateDescriptor<String, Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>> CONFIG = new MapStateDescriptor<>(
+            "Config",
+            BasicTypeInfo.STRING_TYPE_INFO,
+            TypeInformation.of(new TypeHint<Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>>() {
+            })
+    );
+    private static Properties properties = ApplicationConfig.getInstance().getProperties();
+
+    public static void main(String[] args) throws Exception {
+        // 定义执行环境
+        //final StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 设置并行度
+        env.setParallelism(Integer.parseInt(properties.getProperty(PropertiesWord.PARALLELISM, "1")));
+        // 定义重启策略
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
+                3,
+                Time.of(10, TimeUnit.SECONDS)
+        ));
+
+        // 定义配置变更监听数据源
+        DataStreamSource<Message.MsgBean> confChangeStream = env.addSource(
+                new FlinkKafkaConsumer<>("message_topic", new MessageSchema(), properties));
+
+        // 配置广播流
+        BroadcastStream<Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>> broadcastStream =
+                confChangeStream.map(new MapFunction<Message.MsgBean, Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>>() {
+                    @Override
+                    public Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> map(Message.MsgBean value) {
+                        return syncConfig();
+                    }
+                }).broadcast(CONFIG);
+
+        // 处理数据源
+        DataStreamSource<ExchangeMessage.FromDodsToBay> dataStream = env.addSource(
+                new FlinkKafkaConsumer<>(Arrays.asList(properties.getProperty(PropertiesWord.IN_TOPIC).split(","))
+                , new FrameSchema(), properties));
+
+        // 定义发送kafkaProducer
+        FlinkKafkaProducer<ExchangeMessage.Frame> myProducer = new FlinkKafkaProducer<>(
+                properties.getProperty(PropertiesWord.SEND_TOPIC),
+                new FrameSchema(), properties);
+        // 遥测数据处理task
+        dataStream.connect(broadcastStream).process(
+                new BroadcastProcessFunction<ExchangeMessage.FromDodsToBay,
+                        Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>,
+                        ExchangeMessage.Frame>() {
+                private static final String KEY = "conf";
+                private volatile Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple;
+
+                @Override
+                public void open(Configuration parameters) throws Exception {
+                    super.open(parameters);
+                    tuple = syncConfig();
+                }
+
+                @Override
+                public void processElement(ExchangeMessage.FromDodsToBay data,
+                                           ReadOnlyContext ctx,
+                                           Collector<ExchangeMessage.Frame> out) throws Exception {
+                    try {
+                        Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple2 = ctx.getBroadcastState(CONFIG).get(KEY);
+                        if (tuple2 == null) {
+                            tuple2 = this.tuple;
+                        } else {
+                            this.tuple = tuple2;
+                        }
+                        Optional<Map<Long, List<Long>>> optionalMissionMap = tuple2.f0;
+                        if (!optionalMissionMap.isPresent()) {
+                            log.error("Mission config failed.");
+                            return;
+                        }
+                        int dataProtocol = data.getDataProtocol();
+                        IProtocolHandler handler = ProtocolFactory.createProtocolHandler(dataProtocol);
+                        Optional<ExchangeMessage.Frame> optionalFrame = handler.processReceiveData(data.getValue(), data.getDataId(), data.getTransferType(), optionalMissionMap.get());
+                        if (optionalFrame.isPresent()) {
+                            out.collect(optionalFrame.get());
+                        }
+                    } catch (Exception e) {
+                        log.error("Process in data failed.", e);
+                    }
+                }
+
+                @Override
+                public void processBroadcastElement(final Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple2, Context ctx, final Collector<ExchangeMessage.Frame> out) throws Exception {
+                    BroadcastState<String, Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>> broadcastState = ctx.getBroadcastState(CONFIG);
+                    //broadcastState.clear();
+                    broadcastState.put(KEY,tuple2);
+                    log.warn("配置变更:" + tuple2.toString());
+                }
+        }).name("convertHead2Inner").addSink(myProducer);
+
+
+        // 处理遥控数据源
+        DataStreamSource<ExchangeMessage.Frame> ykDataStream = env.addSource(
+                new FlinkKafkaConsumer<>(Arrays.asList(properties.getProperty(PropertiesWord.OUT_TOPIC).split(","))
+                        , new RemoteControlFrameSchema(), properties));
+
+        // 定义遥控发送kafkaProducer
+        FlinkKafkaProducer<ExchangeMessage.FromBayToDods> ykProducer = new FlinkKafkaProducer<>(
+                properties.getProperty(PropertiesWord.BOOTSTRAP_SERVERS),
+                properties.getProperty(PropertiesWord.SEND_TOPIC),
+                new RemoteControlFrameSchema());
+
+        // 遥控数据处理task
+        ykDataStream.connect(broadcastStream).process(
+                new BroadcastProcessFunction<ExchangeMessage.Frame, Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>, ExchangeMessage.FromBayToDods>() {
+                    private static final String KEY = "conf";
+
+                    private volatile Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple;
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        super.open(parameters);
+                        tuple = syncConfig();
+                    }
+
+                    @Override
+                    public void processElement(ExchangeMessage.Frame frame,
+                                               ReadOnlyContext ctx,
+                                               Collector<ExchangeMessage.FromBayToDods> out) throws Exception {
+                        try {
+                            Optional<ExchangeMessage.FromBayToDods> optional = Optional.empty();
+                            if (frame.getHead().getType() == Consts.YK_BID) {
+                                Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple2 = ctx.getBroadcastState(CONFIG).get(KEY);
+                                if (tuple2 == null) {
+                                    tuple2 = this.tuple;
+                                } else {
+                                    this.tuple = tuple2;
+                                }
+                                Optional<Map<Long, Map<String, String>>> optionalStationInfoMap = tuple2.f1;
+                                if (!optionalStationInfoMap.isPresent()) {
+                                    log.error("Mission config failed.");
+                                    return;
+                                }
+                                optional = getRemoteControlFrame(frame, optionalStationInfoMap.get());
+                            }
+                            if (frame.getHead().getType() == Consts.HBG_BID) {
+                                optional = getHeartBeatFrame(frame);
+                            }
+                            if (frame.getHead().getType() == Consts.LINK_DELAY_BID) {
+                                optional = getLinkDelayFrame(frame);
+                            }
+                            if (optional.isPresent()) {
+                                out.collect(optional.get());
+                            }
+                        } catch (Exception e) {
+                            log.error("Process out data faild.", e);
+                        }
+                    }
+                    @Override
+                    public void processBroadcastElement(final Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> tuple2, Context ctx, final Collector<ExchangeMessage.FromBayToDods> out) throws Exception {
+                        BroadcastState<String, Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>>> broadcastState = ctx.getBroadcastState(CONFIG);
+                        //broadcastState.clear();
+                        broadcastState.put(KEY,tuple2);
+                        log.warn("配置变更:" + tuple2.toString());
+                    }
+                }).name("convertHead2outer").addSink(ykProducer);
+
+        env.execute("flinkHeaderPrase");
+    }
+
+    private static Tuple2<Optional<Map<Long, List<Long>>>, Optional<Map<Long, Map<String, String>>>> syncConfig() {
+        String host = properties.getProperty(PropertiesWord.CORE_URL);
+        Map<Long, List<Long>> missionMap = new HashMap<>();
+        String allSpacecraftJson = HttpUtil.get(host + ApiStore.SPACECRAFT.getUrl());
+        JSONObject jsonObjects = JSON.parseObject(allSpacecraftJson).getJSONObject("data");
+        Set<Map.Entry<String, Object>> set = jsonObjects.entrySet();
+        set.stream().forEach(item -> {
+            long k = Long.parseLong(item.getKey(),16);
+            JSONArray jsonArrays = JSONObject.parseArray(item.getValue().toString());
+            List<Long> list = new ArrayList<>();
+            jsonArrays.stream().forEach(o -> list.add(Long.parseLong(((JSONObject) o).getString("spaceIdentificationWord"),16)));
+            missionMap.put(k,list);
+        });
+        Map<Long, Map<String, String>> stationInfoMap = new HashMap<>();
+        String allAddressJson = HttpUtil.get(host + ApiStore.ADDRESS.getUrl());
+        JSONArray jsonArray = JSONObject.parseObject(allAddressJson).getJSONArray("data");
+        jsonArray.stream().forEach(it -> {
+            JSONObject jsonObject = JSONObject.parseObject(it.toString());
+            long addressCode = Long.parseLong(jsonObject.getString("addressCode"), 16);
+            String name = jsonObject.getString("nodeName");
+            Map<String, String> map = new HashMap<>();
+            map.put("name", name);
+            JSONArray addressArrays = jsonObject.getJSONArray("addressIps");
+            if (!CollectionUtils.isEmpty(addressArrays)) {
+                addressArrays.stream().forEach(item -> {
+                    JSONObject sendObject = ((JSONObject) item).getJSONObject("send");
+                    if (!StringUtils.isBlank(sendObject.getString("protocol"))
+                            && !StringUtils.isBlank(sendObject.getString("dataProtocol"))
+                            && !StringUtils.isBlank(sendObject.getString("localPort"))
+                            && !StringUtils.isBlank(sendObject.getString("remotePort"))) {
+                        map.put("dataProtocol", sendObject.getString("dataProtocol"));
+                    }
+                });
+            }
+            stationInfoMap.put(addressCode, map);
+        });
+        log.warn("missionMap=" + missionMap.toString() + ",stationInfoMap=" + stationInfoMap.toString());
+        return new Tuple2<>(Optional.ofNullable(missionMap), Optional.ofNullable(stationInfoMap));
+    }
+
+    /**
+     * 返回遥控信息帧
+     * @param frame
+     * @return
+     * @throws Exception
+     */
+    private  static Optional<ExchangeMessage.FromBayToDods> getRemoteControlFrame(ExchangeMessage.Frame frame, Map<Long, Map<String, String>> stationInfoMap) throws Exception{
+        Optional<ExchangeMessage.Origin> originOptional = PBUtil.unpack(frame.getPayload(), ExchangeMessage.Origin.class);
+        if (!originOptional.isPresent()) {
+            log.warn("parsing remote control failed:" + PBUtil.print(frame.getHead()).orElse("Unable to format data!"));
+            return Optional.empty();
+        }
+        ExchangeMessage.Origin origin = originOptional.get();
+        byte[] bytes = origin.getValue().toByteArray();
+        // 获取地址编码,主要为了获取设备所对应的协议,根据信宿地址选择对应的协议
+        long destination = frame.getHead().getDestination();
+        if (!stationInfoMap.containsKey(destination)) {
+            log.warn("Address " + HexUtil.toHex(destination) + " not setting.");
+            return Optional.empty();
+        }
+        Map<String, String> map = stationInfoMap.get(destination);
+        if (!map.containsKey("dataProtocol")) {
+            log.warn("Address " + HexUtil.toHex(destination) + " not setting dataProtocol.");
+            return Optional.empty();
+        }
+        int protocol = Integer.parseInt(map.get("dataProtocol"));
+        Optional<ExchangeMessage.FromBayToDods> optional = ProtocolFactory.createProtocolHandler(protocol)
+                .processSendData(frame.getHead(), bytes);
+        return Optional.ofNullable(optional.get());
+
+    }
+
+    /**
+     * 返回链监数据帧
+     * @param frame
+     * @return
+     * @throws Exception
+     */
+    private static Optional<ExchangeMessage.FromBayToDods> getHeartBeatFrame(ExchangeMessage.Frame frame) throws Exception{
+        Optional<ExchangeMessage.Origin> originOptional = PBUtil.unpack(frame.getPayload(), ExchangeMessage.Origin.class);
+        if (!originOptional.isPresent()) {
+            log.warn("parsing heart beat failed:" + PBUtil.print(frame.getHead()).orElse("Unable to format data!"));
+            return Optional.empty();
+        }
+        ExchangeMessage.Origin origin = originOptional.get();
+        byte[] bytes = origin.getValue().toByteArray();
+
+        // 构造链监数据到dods的pb,默认使用CSTP协议。由于连接数据只到前置终端,所以对协议无要求,故使用CSTP协议
+        Optional<ExchangeMessage.FromBayToDods> optional = ProtocolFactory.createProtocolHandler(Consts.PROTOCOL_CSTP)
+                .processSendData(frame.getHead(), bytes);
+        return Optional.ofNullable(optional.get());
+
+    }
+
+    /**
+     * 返回链路延时数据帧
+     * @param frame
+     * @return
+     * @throws Exception
+     */
+    private static Optional<ExchangeMessage.FromBayToDods> getLinkDelayFrame(ExchangeMessage.Frame frame) throws Exception{
+        Optional<ExchangeMessage.Origin> originOptional = PBUtil.unpack(frame.getPayload(), ExchangeMessage.Origin.class);
+        if (!originOptional.isPresent()) {
+            log.warn("parsing link delay failed:" + PBUtil.print(frame.getHead()).orElse("Unable to format data!"));
+            return Optional.empty();
+        }
+        ExchangeMessage.Origin origin = originOptional.get();
+        byte[] bytes = origin.getValue().toByteArray();
+
+        // 构造链监数据到dods的pb,默认使用CSTP协议。由于连接数据只到前置终端,所以对协议无要求,故使用CSTP协议
+        Optional<ExchangeMessage.FromBayToDods> optional = ProtocolFactory.createProtocolHandler(Consts.PROTOCOL_CSTP)
+                .processSendData(frame.getHead(), bytes);
+        return Optional.ofNullable(optional.get());
+
+    }
+}
