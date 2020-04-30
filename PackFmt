@@ -1,0 +1,31 @@
+package com.xy.preterminal.core.pack;
+
+public enum PackFmt {
+    c('c',1),
+    b('b',1),
+    B('B',1),
+    h('h',2),
+    H('H',2),
+    i('i',4),
+    I('I',4),
+    l('l',4),
+    L('L',4),
+    q('q',8),
+    Q('Q',8);
+
+    private char k;
+    private int v;
+
+    public char k() {
+        return k;
+    }
+
+    public int v() {
+        return v;
+    }
+
+    PackFmt(char k,int v){
+        this.k=k;
+        this.v=v;
+    }
+}
