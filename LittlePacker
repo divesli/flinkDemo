@@ -1,3 +1,6 @@
+package com.xy.preterminal.core.pack;
+
+import java.math.BigDecimal;
 public class LittleEndianPacker implements IPacker{
 
     private LittleEndianPacker(){}
