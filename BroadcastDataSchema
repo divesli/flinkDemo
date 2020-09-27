@@ -1,0 +1,28 @@
+package com.xy.conf.serialization;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+
+
+@Slf4j
+public class BroadcastDataSchema implements KafkaDeserializationSchema<Tuple2<String, byte[]>>{
+
+    @Override
+    public Tuple2<String, byte[]> deserialize(ConsumerRecord<byte[], byte[]> record) {
+        return Tuple2.of(record.topic(),record.value());
+    }
+
+    @Override
+    public boolean isEndOfStream(Tuple2<String, byte[]> nextElement) {
+        return false;
+    }
+
+    @Override
+    public TypeInformation<Tuple2<String, byte[]>> getProducedType() {
+        return TypeInformation.of(new TypeHint<Tuple2<String, byte[]>>(){});
+    }
+}
