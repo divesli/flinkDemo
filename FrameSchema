@@ -1,0 +1,58 @@
+package com.xy.conf.serialization;
+
+import cn.hutool.core.util.HexUtil;
+import com.xy.ExchangeMessage;
+import com.xy.util.Consts;
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.streaming.util.serialization.KeyedSerializationSchema;
+
+import java.io.IOException;
+
+
+public class FrameSchema implements DeserializationSchema<ExchangeMessage.Frame>, KeyedSerializationSchema<ExchangeMessage.Frame> {
+
+    @Override
+    public ExchangeMessage.Frame deserialize(byte[] message) throws IOException {
+        return ExchangeMessage.Frame.parseFrom(message);
+    }
+
+    @Override
+    public boolean isEndOfStream(ExchangeMessage.Frame nextElement) {
+        return false;
+    }
+
+    @Override
+    public TypeInformation<ExchangeMessage.Frame> getProducedType() {
+        return TypeInformation.of(ExchangeMessage.Frame.class);
+    }
+
+    @Override
+    public byte[] serializeKey(ExchangeMessage.Frame frame) {
+        return  (frame.getHead().getSource() + "_" + frame.getHead().getSpacecraft() + frame.getHead().getFlag()).getBytes();
+    }
+
+    @Override
+    public byte[] serializeValue(ExchangeMessage.Frame frame) {
+        return frame.toByteArray();
+    }
+
+    @Override
+    public String getTargetTopic(ExchangeMessage.Frame frame) {
+        int transferType =  frame.getHead().getTransferType();
+        String k = "";
+        if (transferType == Consts.TRANSFER_SIMULATE) {
+            k = "simulate_";
+        }
+        if (frame.getHead().getType() == Consts.ANGLE_BID) {
+            return k + "WCAngle";
+        }
+        if (frame.getHead().getType() == Consts.DISTANCE_BID) {
+            return k + "WCDistance";
+        }
+        if (frame.getHead().getType() == Consts.SPEED_BID) {
+            return k + "WCSpeed";
+        }
+        return k + "WCError";
+    }
+}
